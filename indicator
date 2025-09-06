@@ -1,0 +1,222 @@
+//@version=5
+indicator("Enhanced Projected Price Range By Adrian", overlay=true, max_boxes_count=100)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+lookback = input.int(14, "ATR Lookback Period", minval=1, maxval=100)
+volFactor = input.float(1.2, "Volatility Multiplier", minval=0.1, maxval=5.0, step=0.1)
+vwapStdDev = input.float(2.0, "VWAP Std Dev Multiplier", minval=1.0, maxval=4.0, step=0.5)
+probLookback = input.int(50, "Probability Calculation Period", minval=20, maxval=200)
+
+// Visual Settings
+showBox = input.bool(true, "Show Range Box", group="Visual Settings")
+showLines = input.bool(true, "Show Range Lines", group="Visual Settings")
+boxTransparency = input.int(85, "Box Transparency", minval=0, maxval=100, group="Visual Settings")
+
+// Color Settings
+highColor = input.color(color.green, "Predicted High Color", group="Colors")
+lowColor = input.color(color.red, "Predicted Low Color", group="Colors")
+boxColor = input.color(color.blue, "Box Color", group="Colors")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VWAP AND STANDARD DEVIATION CALCULATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// VWAP calculation
+vwapValue = ta.vwap(hlc3)
+vwapStdDevValue = ta.stdev(hlc3 - vwapValue, 20) * vwapStdDev
+
+// VWAP bands for overextension detection
+vwapUpperBand = vwapValue + vwapStdDevValue
+vwapLowerBand = vwapValue - vwapStdDevValue
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FIXED ESTIMATED TR CALCULATION (SET AT CANDLE OPEN)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ATR calculation
+atrValue = ta.atr(lookback)
+
+// Fixed components (don't change during candle)
+openGap = math.abs(open - close[1])
+previousTR = ta.tr[1] // Previous candle's true range for context
+
+// VWAP overextension factor (fixed at open)
+distanceFromVwap = math.abs(open - vwapValue)
+vwapOverextensionFactor = distanceFromVwap > vwapStdDevValue ? 1.3 : 1.0
+
+// Fixed Estimated TR - calculated once at candle open
+var float fixedEstTR = na
+if barstate.isnew
+    // Combine multiple factors for better estimation
+    baseRange = atrValue * volFactor
+    gapAdjustment = openGap * 0.5 // Give gaps some weight but not full
+    vwapAdjustment = baseRange * (vwapOverextensionFactor - 1.0)
+    recentVolatility = previousTR > atrValue ? (previousTR - atrValue) * 0.3 : 0
+    
+    fixedEstTR := baseRange + gapAdjustment + vwapAdjustment + recentVolatility
+
+// Use current value for real-time bar, fixed value for historical bars
+estimatedTR = barstate.isnew ? fixedEstTR : fixedEstTR
+
+// Fixed projected levels (set at candle open)
+var float fixedProjHigh = na
+var float fixedProjLow = na
+
+if barstate.isnew
+    fixedProjHigh := open + estimatedTR / 2
+    fixedProjLow := open - estimatedTR / 2
+
+projectedHigh = barstate.isnew ? fixedProjHigh : fixedProjHigh
+projectedLow = barstate.isnew ? fixedProjLow : fixedProjLow
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FIXED PROBABILITY CALCULATIONS (SET ONCE PER CANDLE)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Historical tracking arrays
+var array<bool> highHitHistory = array.new<bool>()
+var array<bool> lowHitHistory = array.new<bool>()
+var array<bool> atrAccuracyHistory = array.new<bool>()
+var array<bool> estTrAccuracyHistory = array.new<bool>()
+
+// Fixed probabilities (calculated once per candle)
+var float probHigh = na
+var float probLow = na
+var float probATRAccuracy = na
+var float probEstTRAccuracy = na
+
+// Calculate probabilities only on confirmed bars
+if barstate.isconfirmed
+    // Check if targets were hit
+    hitHigh = high >= fixedProjHigh
+    hitLow = low <= fixedProjLow
+    
+    // Check ATR accuracy (within 20% tolerance)
+    actualTR = ta.tr
+    atrAccurate = math.abs(actualTR - atrValue) <= (atrValue * 0.2)
+    
+    // Check Est TR accuracy (within 15% tolerance)
+    estTrAccurate = math.abs(actualTR - fixedEstTR) <= (fixedEstTR * 0.15)
+    
+    // Update history arrays
+    array.push(highHitHistory, hitHigh)
+    array.push(lowHitHistory, hitLow)
+    array.push(atrAccuracyHistory, atrAccurate)
+    array.push(estTrAccuracyHistory, estTrAccurate)
+    
+    // Maintain array size
+    if array.size(highHitHistory) > probLookback
+        array.shift(highHitHistory)
+        array.shift(lowHitHistory)
+        array.shift(atrAccuracyHistory)
+        array.shift(estTrAccuracyHistory)
+
+// Calculate probabilities at the start of each new candle
+if barstate.isnew and array.size(highHitHistory) > 5
+    // Count successes
+    highSuccesses = 0
+    lowSuccesses = 0
+    atrSuccesses = 0
+    estTrSuccesses = 0
+    
+    for i = 0 to array.size(highHitHistory) - 1
+        if array.get(highHitHistory, i)
+            highSuccesses += 1
+        if array.get(lowHitHistory, i)
+            lowSuccesses += 1
+        if array.get(atrAccuracyHistory, i)
+            atrSuccesses += 1
+        if array.get(estTrAccuracyHistory, i)
+            estTrSuccesses += 1
+    
+    // Calculate fixed probabilities for this candle
+    totalSamples = array.size(highHitHistory)
+    probHigh := (highSuccesses / totalSamples) * 100
+    probLow := (lowSuccesses / totalSamples) * 100
+    probATRAccuracy := (atrSuccesses / totalSamples) * 100
+    probEstTRAccuracy := (estTrSuccesses / totalSamples) * 100
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VISUALIZATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Box visualization
+var box rangeBox = na
+if showBox
+    if barstate.isnew
+        if not na(rangeBox)
+            box.delete(rangeBox)
+        rangeBox := box.new(left=bar_index, top=projectedHigh, right=bar_index + 1, bottom=projectedLow, border_color=boxColor, bgcolor=color.new(boxColor, boxTransparency), border_width=1)
+    else if not na(rangeBox)
+        box.set_right(rangeBox, bar_index + 1)
+
+// Line plots - these must be at global scope
+highLine = showLines ? projectedHigh : na
+lowLine = showLines ? projectedLow : na
+
+plot(highLine, "Projected High", color=highColor, linewidth=2)
+plot(lowLine, "Projected Low", color=lowColor, linewidth=2)
+
+// Visual breakout signals
+isBreakoutHigh = high > projectedHigh
+isBreakoutLow = low < projectedLow
+
+plotshape(isBreakoutHigh, "Breakout High", shape.triangleup, location.abovebar, color=color.new(color.lime, 0), size=size.small)
+plotshape(isBreakoutLow, "Breakout Low", shape.triangledown, location.belowbar, color=color.new(color.orange, 0), size=size.small)
+
+// Background coloring for better visualization
+bgcolor(isBreakoutHigh ? color.new(color.green, 95) : isBreakoutLow ? color.new(color.red, 95) : na, title="Breakout Background")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENHANCED INFO TABLE WITH FIXED PROBABILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if barstate.islast
+    var table infoTable = table.new(position.top_right, 3, 8, bgcolor=color.new(color.black, 80), border_width=1, border_color=color.gray)
+    
+    // Headers
+    table.cell(infoTable, 0, 0, "Metric", text_color=color.white, text_size=size.small, bgcolor=color.new(color.blue, 70))
+    table.cell(infoTable, 1, 0, "Value", text_color=color.white, text_size=size.small, bgcolor=color.new(color.blue, 70))
+    table.cell(infoTable, 2, 0, "Prob %", text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 70))
+    
+    // Current Range Data
+    table.cell(infoTable, 0, 1, "ATR", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 1, str.tostring(atrValue, "#.##"), text_color=color.white, text_size=size.tiny)
+    table.cell(infoTable, 2, 1, str.tostring(probATRAccuracy, "#.#") + "%", 
+               text_color=probATRAccuracy > 70 ? color.lime : probATRAccuracy > 50 ? color.yellow : color.orange, text_size=size.tiny)
+    
+    table.cell(infoTable, 0, 2, "Est. TR", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 2, str.tostring(fixedEstTR, "#.##"), text_color=color.white, text_size=size.tiny)
+    table.cell(infoTable, 2, 2, str.tostring(probEstTRAccuracy, "#.#") + "%", 
+               text_color=probEstTRAccuracy > 70 ? color.lime : probEstTRAccuracy > 50 ? color.yellow : color.orange, text_size=size.tiny)
+    
+    // Fixed Projected Levels with Fixed Probabilities
+    table.cell(infoTable, 0, 3, "Proj. High", text_color=highColor, text_size=size.tiny)
+    table.cell(infoTable, 1, 3, str.tostring(fixedProjHigh, "#.##"), text_color=highColor, text_size=size.tiny)
+    table.cell(infoTable, 2, 3, str.tostring(probHigh, "#.#") + "%", 
+               text_color=probHigh > 50 ? color.lime : probHigh > 30 ? color.yellow : color.orange, text_size=size.tiny)
+    
+    table.cell(infoTable, 0, 4, "Proj. Low", text_color=lowColor, text_size=size.tiny)
+    table.cell(infoTable, 1, 4, str.tostring(fixedProjLow, "#.##"), text_color=lowColor, text_size=size.tiny)
+    table.cell(infoTable, 2, 4, str.tostring(probLow, "#.#") + "%", 
+               text_color=probLow > 50 ? color.lime : probLow > 30 ? color.yellow : color.orange, text_size=size.tiny)
+    
+    // VWAP Information
+    table.cell(infoTable, 0, 5, "VWAP", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 5, str.tostring(vwapValue, "#.##"), text_color=color.white, text_size=size.tiny)
+    table.cell(infoTable, 2, 5, close > vwapUpperBand ? "O-EXT+" : close < vwapLowerBand ? "O-EXT-" : "NORMAL", 
+               text_color=close > vwapUpperBand or close < vwapLowerBand ? color.red : color.lime, text_size=size.tiny)
+    
+    // Gap Analysis
+    table.cell(infoTable, 0, 6, "Open Gap", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 6, str.tostring(openGap, "#.##"), text_color=color.white, text_size=size.tiny)
+    table.cell(infoTable, 2, 6, openGap > atrValue * 0.3 ? "LARGE" : "NORMAL", 
+               text_color=openGap > atrValue * 0.3 ? color.orange : color.silver, text_size=size.tiny)
+    
+    // Sample Size
+    table.cell(infoTable, 0, 7, "Sample", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 7, str.tostring(array.size(highHitHistory)), text_color=color.white, text_size=size.tiny)
+    table.cell(infoTable, 2, 7, array.size(highHitHistory) >= 30 ? "GOOD" : "BUILDING", 
+               text_color=array.size(highHitHistory) >= 30 ? color.lime : color.yellow, text_size=size.tiny)
